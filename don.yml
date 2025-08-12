@@ -1,0 +1,219 @@
+- name: Update system repositories
+  hosts: localhost
+  become: true
+  tasks:
+    # Update system repos without system upgrading
+    - name: Update the system
+      ansible.builtin.apt:
+        update_cache: yes
+        upgrade: no
+      register: apt_result
+      failed_when: apt_result.failed and 'unable to fetch' not in apt_result.msg
+
+- name: OpenVPN installation and configuration
+  hosts: localhost
+  become: true
+  vars:
+    - file_browser_dir: /var/www/files
+  vars_files:
+    - users.yml
+  tasks:
+    #  Get the current user to define where will be config files
+    - name: get the username running the deploy
+      ansible.builtin.shell:
+        "getent passwd gorin  | awk -F: '{ print $6 }'"
+      register: username_on_the_host
+
+    # Print the figured user
+    - name: Debug check the user
+      ansible.builtin.debug:
+        msg: "Check the user {{ username_on_the_host.stdout }}"
+
+    # Check if OpenVPN server already configure
+    - name: Check if
+      ansible.builtin.stat:
+        path: "/etc/openvpn/server.conf"
+      register: server_conf
+
+    # Download OpenVPN script installation if the ovpn server is not configured
+    - name: Download OpenVPN installation script
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/angristan/openvpn-install/master/openvpn-install.sh"
+        dest: "/tmp/openvpn-install.sh"
+        mode: "0700"
+
+    # Start OpenVPN installation and configuring
+    # Also creates one config for xyz user
+    - name: Run OpenVPN installation script
+      ansible.builtin.command:
+        "env APPROVE_INSTALL=y APPROVE_IP=y IPV6_SUPPORT=n PORT_CHOICE=2 PORT=1195 PROTOCOL_CHOICE=1
+        DNS=1 COMPRESSION_ENABLED=n CUSTOMIZE_ENC=n CLIENT=xyz PASS=1 /tmp/openvpn-install.sh"
+      register: script_run
+      when: not server_conf.stat.exists
+
+    # Generate config for the rest users from the user list
+    - name: Run others clients creation
+      ansible.builtin.command:
+        "env MENU_OPTION=1 PASS=1 CLIENT={{ item.name }} /tmp/openvpn-install.sh"
+      loop: "{{ openvpn_users | selectattr('state', 'equalto', 'active') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # Creating folder for browsing
+    - name: Create directory for file browsing
+      ansible.builtin.file:
+        path: "{{ file_browser_dir }}"
+        state: directory
+        mode: '0755'
+
+    # Check if config for a user was created
+    - name: Check existing config for active users
+      ansible.builtin.stat:
+        path: "{{ username_on_the_host.stdout }}/{{ item.name }}.ovpn"
+      register: ready_config_stat
+      loop: "{{ openvpn_users | selectattr('state', 'equalto', 'active') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # Copying configs that were created
+    - name: Download client configuration files to the local files directory
+      ansible.builtin.copy:
+        src: "{{ username_on_the_host.stdout }}/{{ item.name }}.ovpn"
+        dest: "{{ file_browser_dir }}/{{ item.name }}.ovpn"
+        mode: '644'
+      loop: "{{ openvpn_users | selectattr('state', 'equalto', 'active') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: (ready_config_stat.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stat.exists') | first | default(false))
+
+
+- name: Docker config and run
+  hosts: localhost
+  become: true
+  vars:
+    nginx_config_dir: /etc/docker/nginx
+    file_browser_dir: /var/www/files
+  tasks:
+    # Installing Docker
+    - name: Install required packages (including Docker)
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - python3-pip
+        state: present
+        update_cache: yes
+      register: docker_install
+
+    # Installing Docker pithon module without replacing
+    - name: Install Docker Python module
+      ansible.builtin.pip:
+        name: docker
+        state: present
+      when: docker_install.changed is defined and docker_install.changed
+
+    - name: Start and enable Docker service
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Pull nginx Docker image
+      community.docker.docker_image:
+        name: "nginx"
+        state: present
+        source: pull
+
+    # Check if nginx installed locally
+    - name: Check if local Nginx is running
+      ansible.builtin.command: systemctl is-active nginx
+      register: nginx_status
+      changed_when: false
+      failed_when: false
+
+    # Comment listening 80 port if there's nginx in /etc/nginx/nginx.conf
+    - name: Modify nginx.conf to remove listen 80
+      ansible.builtin.lineinfile:
+        path: /etc/nginx/nginx.conf
+        regexp: '^(\s*listen\s+80(?:\s|;))'
+        line: '# \1  # disabled by Ansible'
+        backrefs: yes
+        state: present
+      when: nginx_status.rc == 0
+      register: nginx_conf_modify
+      ignore_errors: yes
+
+    # Comment listening 80 port if there's nginx in all /etc/nginx/sites-enabled configs
+    - name: Modify sites-enabled files to remove listen 80
+      ansible.builtin.lineinfile:
+        path: "{{ item }}"
+        regexp: '^(\s*listen\s+80(?:\s|;))'
+        line: '# \1  # disabled by Ansible'
+        backrefs: yes
+        state: present
+      loop: "{{ query('fileglob', '/etc/nginx/sites-enabled/*') }}"
+      when: nginx_status.rc == 0
+      register: sites_modify
+      ignore_errors: yes
+
+    - name: Reload Nginx configuration if modified
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+      when: (nginx_conf_modify.changed is defined and nginx_conf_modify.changed) or (sites_modify.changed is defined and sites_modify.changed)
+      ignore_errors: yes
+
+    - name: Create directory for Nginx configuration
+      ansible.builtin.file:
+        path: "{{ nginx_config_dir }}"
+        state: directory
+        mode: '0755'
+
+    # Configuring nginx config for container
+    - name: Copy custom Nginx configuration
+      ansible.builtin.copy:
+        dest: "{{ nginx_config_dir }}/nginx.conf"
+        content: |
+          events {}
+          
+          http {
+              server {
+                  listen 80;
+                  server_name _;
+          
+                  location / {
+                      root /usr/share/nginx/html;
+                      autoindex on; # Включает файловый браузер
+                  }
+              }
+          }
+        mode: '0644'
+      register: nginx_config
+
+    # Creating directory for config browsing if it's still not created
+    - name: Create directory for file browser on host
+      ansible.builtin.file:
+        path: "{{ file_browser_dir }}"
+        state: directory
+        mode: '0755'
+
+    # Run nginx container with settings
+    - name: Run Nginx container
+      ansible.builtin.docker_container:
+        name: nginx_web
+        image: nginx
+        state: started
+        restart_policy: unless-stopped
+        ports:
+          - "80:80"
+        published_ports:
+          - "0.0.0.0:80:80"
+        volumes:
+          - "{{ file_browser_dir }}:/usr/share/nginx/html"
+          - "{{ nginx_config_dir }}/nginx.conf:/etc/nginx/nginx.conf"
+      register: docker_container
+
+    # Check container status
+    - name: Debug container status
+      ansible.builtin.debug:
+          msg: "Nginx container {{ docker_container.changed | ternary('started/updated', 'already running') }}"
+      when: docker_container.changed is defined

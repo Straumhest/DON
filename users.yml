@@ -1,0 +1,10 @@
+# List of users that should have vpn access to 1c server
+# In case user is not commented and has "activ" state, cert, key and config
+# will be generated for this user
+openvpn_users:
+  - name: artem
+    state: active
+  - name: gorin
+    state: active
+  - name: xyz
+    state: active
